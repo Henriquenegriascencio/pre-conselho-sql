@@ -1,34 +1,34 @@
 const express = require('express');
-const mysql = require('mysql2/promise');
-const app = express();
+const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
 
+const app = express();
 app.use(express.json());
 
-// Configuração do Banco de Dados
-const db = mysql.createPool({
-    host: 'localhost',
-    user: 'root',
-    password: '', // Insira a sua senha do MySQL aqui
-    database: 'pre_conselho_db'
-});
+// Conexão com o Supabase usando variáveis de ambiente
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
-// 1. Rota Principal: Redireciona para o login por padrão
+// Servir arquivos estáticos (HTML, CSS, JS)
+app.use(express.static(__dirname));
+
+// Rota principal
 app.get('/', (req, res) => {
     res.sendFile(__dirname + '/login.html');
 });
 
-// 2. Servir Ficheiros Estáticos (HTML, CSS, JS)
-app.use(express.static(__dirname));
-
-// --- ROTAS DE AUTENTICAÇÃO ---
+// --- AUTENTICAÇÃO ---
 
 app.post('/api/auth/cadastro', async (req, res) => {
     const { nome, email, senha, tipo } = req.body;
     try {
-        await db.query(
-            'INSERT INTO usuarios (nome, email, senha, tipo) VALUES (?, ?, ?, ?)',
-            [nome, email, senha, tipo]
-        );
+        const { error } = await supabase
+            .from('usuarios')
+            .insert([{ nome, email, senha, tipo }]);
+
+        if (error) throw error;
+
         res.status(201).json({ message: 'Usuário cadastrado com sucesso!' });
     } catch (err) {
         console.error('Erro no cadastro:', err);
@@ -39,12 +39,15 @@ app.post('/api/auth/cadastro', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     const { email, senha } = req.body;
     try {
-        const [usuarios] = await db.query(
-            'SELECT id, nome, email, tipo FROM usuarios WHERE email = ? AND senha = ?',
-            [email, senha]
-        );
+        const { data: usuarios, error } = await supabase
+            .from('usuarios')
+            .select('id, nome, email, tipo')
+            .eq('email', email)
+            .eq('senha', senha);
 
-        if (usuarios.length === 0) {
+        if (error) throw error;
+
+        if (!usuarios || usuarios.length === 0) {
             return res.status(401).json({ error: 'E-mail ou senha inválidos.' });
         }
 
@@ -60,61 +63,90 @@ app.post('/api/auth/login', async (req, res) => {
 app.post('/api/admin/fichas', async (req, res) => {
     const { titulo, turma_id, materia_id, data_limite, perguntas } = req.body;
     try {
-        const [result] = await db.query(
-            'INSERT INTO fichas_avaliacao (titulo, turma_id, materia_id, data_limite) VALUES (?, ?, ?, ?)',
-            [titulo, turma_id, materia_id, data_limite]
-        );
-        
-        const fichaId = result.insertId;
+        const { data: ficha, error: errFicha } = await supabase
+            .from('fichas_avaliacao')
+            .insert([{ titulo, turma_id, materia_id, data_limite }])
+            .select()
+            .single();
+
+        if (errFicha) throw errFicha;
+
+        const fichaId = ficha.id;
 
         if (perguntas && perguntas.length > 0) {
-            for (let p of perguntas) {
-                await db.query(
-                    'INSERT INTO perguntas (ficha_id, texto_pergunta, categoria) VALUES (?, ?, ?)',
-                    [fichaId, p.texto_pergunta, p.categoria || 'Geral']
-                );
-            }
+            const perguntasParaInserir = perguntas.map(p => ({
+                ficha_id: fichaId,
+                texto_pergunta: p.texto_pergunta,
+                categoria: p.categoria || 'Geral'
+            }));
+
+            const { error: errPerguntas } = await supabase
+                .from('perguntas')
+                .insert(perguntasParaInserir);
+
+            if (errPerguntas) throw errPerguntas;
         }
 
         res.status(201).json({ message: 'Ficha criada com sucesso!', fichaId });
     } catch (err) {
-        console.error('Erro ao criar ficha no MySQL:', err);
+        console.error('Erro ao criar ficha:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// Buscar respostas agrupadas com informações da turma e professor
 app.get('/api/admin/fichas/:id/respostas', async (req, res) => {
     try {
-        const [respostas] = await db.query(
-            `SELECT 
-                r.id,
-                p.texto_pergunta,
-                p.categoria,
-                u.nome AS professor_nome,
-                f.turma_id,
-                r.resposta,
-                r.anotacoes
-            FROM respostas_pre_conselho r
-            JOIN perguntas p ON r.pergunta_id = p.id
-            JOIN usuarios u ON r.professor_id = u.id
-            JOIN fichas_avaliacao f ON r.ficha_id = f.id
-            WHERE r.ficha_id = ?
-            ORDER BY u.nome, p.id`,
-            [req.params.id]
-        );
-        res.json(respostas);
+        // Consulta unindo as tabelas relacionadas
+        const { data: respostas, error } = await supabase
+            .from('respostas_pre_conselho')
+            .select(`
+                id,
+                resposta,
+                anotacoes,
+                perguntas!inner (
+                    texto_pergunta,
+                    categoria
+                ),
+                usuarios!inner (
+                    nome
+                ),
+                fichas_avaliacao!inner (
+                    turma_id
+                )
+            `)
+            .eq('ficha_id', req.params.id);
+
+        if (error) throw error;
+
+        // Formatação dos dados para o front-end
+        const resultadoFormatado = respostas.map(r => ({
+            id: r.id,
+            texto_pergunta: r.perguntas?.texto_pergunta,
+            categoria: r.perguntas?.categoria,
+            professor_nome: r.usuarios?.nome,
+            turma_id: r.fichas_avaliacao?.turma_id,
+            resposta: r.resposta,
+            anotacoes: r.anotacoes
+        }));
+
+        res.json(resultadoFormatado);
     } catch (err) {
         console.error('Erro ao buscar respostas:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// --- ROTAS DO PROFESSOR (CONSULTA E RESPOSTAS) ---
+// --- ROTAS DO PROFESSOR ---
 
 app.get('/api/professor/fichas', async (req, res) => {
     try {
-        const [fichas] = await db.query('SELECT * FROM fichas_avaliacao ORDER BY id DESC');
+        const { data: fichas, error } = await supabase
+            .from('fichas_avaliacao')
+            .select('*')
+            .order('id', { ascending: false });
+
+        if (error) throw error;
+
         res.json(fichas);
     } catch (err) {
         console.error('Erro ao buscar fichas:', err);
@@ -124,10 +156,13 @@ app.get('/api/professor/fichas', async (req, res) => {
 
 app.get('/api/fichas/:id/perguntas', async (req, res) => {
     try {
-        const [perguntas] = await db.query(
-            'SELECT * FROM perguntas WHERE ficha_id = ?',
-            [req.params.id]
-        );
+        const { data: perguntas, error } = await supabase
+            .from('perguntas')
+            .select('*')
+            .eq('ficha_id', req.params.id);
+
+        if (error) throw error;
+
         res.json(perguntas);
     } catch (err) {
         console.error('Erro ao buscar perguntas:', err);
@@ -138,12 +173,20 @@ app.get('/api/fichas/:id/perguntas', async (req, res) => {
 app.post('/api/professor/respostas', async (req, res) => {
     const { ficha_id, professor_id, respostas } = req.body;
     try {
-        for (let r of respostas) {
-            await db.query(
-                'INSERT INTO respostas_pre_conselho (ficha_id, pergunta_id, professor_id, resposta, anotacoes) VALUES (?, ?, ?, ?, ?)',
-                [ficha_id, r.pergunta_id, professor_id, r.resposta, r.anotacoes || '']
-            );
-        }
+        const registrosParaInserir = respostas.map(r => ({
+            ficha_id,
+            pergunta_id: r.pergunta_id,
+            professor_id,
+            resposta: r.resposta,
+            anotacoes: r.anotacoes || ''
+        }));
+
+        const { error } = await supabase
+            .from('respostas_pre_conselho')
+            .insert(registrosParaInserir);
+
+        if (error) throw error;
+
         res.status(201).json({ message: 'Respostas enviadas com sucesso!' });
     } catch (err) {
         console.error('Erro ao salvar respostas:', err);
@@ -151,6 +194,8 @@ app.post('/api/professor/respostas', async (req, res) => {
     }
 });
 
-app.listen(3000, () => {
-    console.log('Servidor rodando em http://localhost:3000');
+// Porta dinâmica (essencial para servidores online como Render/Railway)
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
 });
